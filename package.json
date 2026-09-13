@@ -1,0 +1,32 @@
+{
+  "name": "@lathly/dsh-tool-model-switch",
+  "description": "DSH model switching tool — switch_model and list_models tools for runtime LLM route selection",
+  "version": "1.0.0",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Lathly/dsh-tool-model-switch.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Lathly/dsh-tool-model-switch/issues"
+  },
+  "homepage": "https://github.com/Lathly/dsh-tool-model-switch#readme",
+  "type": "module",
+  "main": "lib/index.js",
+  "types": "lib/types/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/types/index.d.ts",
+      "default": "./lib/index.js"
+    }
+  },
+  "files": [
+    "lib/",
+    "src/",
+    "README.md"
+  ],
+  "dependencies": {
+    "@deepseek-ai/cordis": "^0.1.0",
+    "@deepseek-ai/dsh-tools": "^0.1.0"
+  }
+}

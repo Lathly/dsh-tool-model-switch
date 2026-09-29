@@ -1,0 +1,8 @@
+# dsh-tool-model-switch bundle layer: mounts the function plugin, which
+# registers the model-facing switch_model and list_models tools on
+# ctx.tools. The tools delegate to the optional sessionController service
+# lazily, so a deployment without one keeps the tools visible and fails
+# the calls at call time with a fixed error.
+- insert:
+  - id: tool-model-switch
+    name: '@lathly/dsh-tool-model-switch'

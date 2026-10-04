@@ -74,14 +74,15 @@ interface Bench {
 }
 
 /** Boot tools + agent registry, mount the tool package, and optionally serve the controller. */
-async function harness(withController: boolean, selectError?: Error): Promise<Bench> {
+async function harness(withController: boolean, selectError?: Error, config?: ToolModelSwitch.Config): Promise<Bench> {
   const ctx = new Context()
   await ctx.plugin(SystemPrompt)
   await ctx.plugin(ToolRuntime)
   await ctx.plugin(AgentRegistry)
   const mock = mockController(selectError)
   if (withController) ctx.provide('sessionController', mock.controller)
-  await ctx.plugin(ToolModelSwitch)
+  if (config !== undefined) await ctx.plugin(ToolModelSwitch, config)
+  else await ctx.plugin(ToolModelSwitch)
   const id = SessionId('model-switch-agent')
   const agent = { id, session: Session.create(id), status: 'idle', ctx } as Agent
   ctx.agents.register(agent)
@@ -202,9 +203,8 @@ describe('switch_model', () => {
     expect(mock.selectCalls).toEqual([])
   })
 
-  it('propagates the controller rejection', async () => {
-    const unavailable = new Error('session/model-unavailable: llama-cpp has no model nope')
-    const { ctx, agent } = await harness(true, unavailable)
+  it('rejects an unavailable route at the availability gate when no fallback is configured', async () => {
+    const { ctx, agent, mock } = await harness(true)
     const result = await ctx.tools.execute({
       signal: new AbortController().signal,
       callId: ToolCallId('switch-unavailable'),
@@ -212,8 +212,204 @@ describe('switch_model', () => {
       arguments: { provider: 'llama-cpp', model: 'nope' },
       agent,
     })
+    // `nope` is not in the catalog and no `fallback` is configured, so the only
+    // candidate is unavailable and the tool fails before any `selectModel`.
     expect(result.isError).toBe(true)
-    expect(resultText(result)).toContain('session/model-unavailable: llama-cpp has no model nope')
+    expect(mock.selectCalls).toEqual([])
+    expect(resultText(result)).toContain('none of the 1 candidate route(s) are currently available')
+  })
+
+  it('propagates the controller rejection when the catalog is optimistic', async () => {
+    const unavailable = new Error('session/model-unavailable: llama-cpp rejected the route at commit time')
+    const { ctx, agent, mock } = await harness(true, unavailable)
+    const result = await ctx.tools.execute({
+      signal: new AbortController().signal,
+      callId: ToolCallId('switch-rejected'),
+      name: 'switch_model',
+      arguments: { provider: 'llama-cpp', model: 'Qwen3.8-27B-Ridge' },
+      agent,
+    })
+    // The catalog lists the route, so the ladder delegates; the controller's
+    // rejection then surfaces.
+    expect(result.isError).toBe(true)
+    expect(mock.selectCalls).toEqual([{ sessionId: agent.id, provider: 'llama-cpp', model: 'Qwen3.8-27B-Ridge' }])
+    expect(resultText(result)).toContain('session/model-unavailable: llama-cpp rejected the route at commit time')
+  })
+})
+
+describe('switch_model fallback ladder', () => {
+  it('uses the requested route when it is live, even with a fallback configured', async () => {
+    const { ctx, agent, mock } = await harness(
+      true,
+      undefined,
+      { fallback: [{ provider: 'openai', model: 'gpt-x' }] },
+    )
+    const result = await ctx.tools.execute({
+      signal: new AbortController().signal,
+      callId: ToolCallId('fb-live-requested'),
+      name: 'switch_model',
+      arguments: { provider: 'llama-cpp', model: 'Qwen3.8-27B-Ridge' },
+      agent,
+    })
+    expect(result.isError).toBe(false)
+    expect(mock.selectCalls).toEqual([{ sessionId: agent.id, provider: 'llama-cpp', model: 'Qwen3.8-27B-Ridge' }])
+    expect(resultText(result)).toBe(
+      'Switched this session\'s model to llama-cpp/Qwen3.8-27B-Ridge. '
+      + 'Effective from the next model request; the default for new sessions now matches this selection.',
+    )
+  })
+
+  it('falls back to the first live route when the requested route is dead', async () => {
+    const { ctx, agent, mock } = await harness(
+      true,
+      undefined,
+      {
+        fallback: [
+          { provider: 'llama-cpp', model: 'Qwen3.8-27b-Samantha-NVFP4' },
+          { provider: 'openai', model: 'gpt-x' },
+        ],
+      },
+    )
+    const result = await ctx.tools.execute({
+      signal: new AbortController().signal,
+      callId: ToolCallId('fb-first-live'),
+      name: 'switch_model',
+      arguments: { provider: 'xai', model: 'grok-gone' },
+      agent,
+    })
+    // `xai` is not in the catalog, so the first live fallback (Samantha) wins.
+    expect(result.isError).toBe(false)
+    expect(mock.selectCalls).toEqual([{ sessionId: agent.id, provider: 'llama-cpp', model: 'Qwen3.8-27b-Samantha-NVFP4' }])
+    const text = resultText(result)
+    expect(text).toContain('llama-cpp/Qwen3.8-27b-Samantha-NVFP4')
+    expect(text).toContain('priority 1 of 2 was used instead')
+  })
+
+  it('walks the ladder until the first live route, skipping dead fallback entries', async () => {
+    const { ctx, agent, mock } = await harness(
+      true,
+      undefined,
+      {
+        fallback: [
+          { provider: 'anthropic', model: 'claude-x' }, // dead: in `failures`
+          { provider: 'openai', model: 'gpt-x' },       // live
+        ],
+      },
+    )
+    const result = await ctx.tools.execute({
+      signal: new AbortController().signal,
+      callId: ToolCallId('fb-skip-dead'),
+      name: 'switch_model',
+      arguments: { provider: 'xai', model: 'grok-gone' },
+      agent,
+    })
+    // Priority 1 (anthropic) is dead; priority 2 (openai) is live.
+    expect(result.isError).toBe(false)
+    expect(mock.selectCalls).toEqual([{ sessionId: agent.id, provider: 'openai', model: 'gpt-x' }])
+    const text = resultText(result)
+    expect(text).toContain('openai/gpt-x')
+    expect(text).toContain('priority 2 of 2 was used instead')
+  })
+
+  it('fails loud when every candidate route is dead, naming the catalog failures', async () => {
+    const { ctx, agent, mock } = await harness(
+      true,
+      undefined,
+      { fallback: [{ provider: 'anthropic', model: 'claude-x' }] },
+    )
+    const result = await ctx.tools.execute({
+      signal: new AbortController().signal,
+      callId: ToolCallId('fb-all-dead'),
+      name: 'switch_model',
+      arguments: { provider: 'xai', model: 'grok-gone' },
+      agent,
+    })
+    // Both candidates are dead (xai not in catalog; anthropic in failures).
+    expect(result.isError).toBe(true)
+    expect(mock.selectCalls).toEqual([])
+    const text = resultText(result)
+    expect(text).toContain('none of the 2 candidate route(s) are currently available')
+    expect(text).toContain('anthropic — catalog load failed')
+  })
+
+  it('dedupes a fallback entry that repeats the requested route', async () => {
+    const { ctx, agent, mock } = await harness(
+      true,
+      undefined,
+      { fallback: [{ provider: 'llama-cpp', model: 'Qwen3.8-27B-Ridge' }] },
+    )
+    const result = await ctx.tools.execute({
+      signal: new AbortController().signal,
+      callId: ToolCallId('fb-dedupe'),
+      name: 'switch_model',
+      arguments: { provider: 'llama-cpp', model: 'Qwen3.8-27B-Ridge' },
+      agent,
+    })
+    // The requested route is live; the duplicate fallback is ignored, so no
+    // fallback note is appended.
+    expect(result.isError).toBe(false)
+    expect(mock.selectCalls).toEqual([{ sessionId: agent.id, provider: 'llama-cpp', model: 'Qwen3.8-27B-Ridge' }])
+    expect(resultText(result)).not.toContain('was used instead')
+  })
+
+  it('carries a fallback route\'s reasoning effort into the delegated request', async () => {
+    const { ctx, agent, mock } = await harness(
+      true,
+      undefined,
+      { fallback: [{ provider: 'openai', model: 'gpt-x', reasoning_effort: 'high' }] },
+    )
+    const result = await ctx.tools.execute({
+      signal: new AbortController().signal,
+      callId: ToolCallId('fb-effort'),
+      name: 'switch_model',
+      arguments: { provider: 'xai', model: 'grok-gone' },
+      agent,
+    })
+    // The requested route is dead; the live fallback carries its effort.
+    expect(result.isError).toBe(false)
+    expect(mock.selectCalls).toEqual([{ sessionId: agent.id, provider: 'openai', model: 'gpt-x', reasoningEffort: 'high' }])
+    expect(resultText(result)).toContain('openai/gpt-x (reasoning effort high)')
+    expect(resultText(result)).toContain('priority 1 of 1 was used instead')
+  })
+})
+
+describe('config validation', () => {
+  it('accepts an omitted config', () => {
+    expect(ToolModelSwitch.validateConfig(undefined)).toEqual({})
+  })
+
+  it('accepts an empty fallback list', () => {
+    expect(ToolModelSwitch.validateConfig({ fallback: [] })).toEqual({ fallback: [] })
+  })
+
+  it('rejects a non-object config', () => {
+    expect(() => ToolModelSwitch.validateConfig('x')).toThrow(
+      'tool-model-switch: config must be an object with an optional `fallback` list',
+    )
+  })
+
+  it('rejects a non-list fallback', () => {
+    expect(() => ToolModelSwitch.validateConfig({ fallback: 'nope' })).toThrow(
+      'tool-model-switch: `fallback` must be a list of `{ provider, model }` routes',
+    )
+  })
+
+  it('rejects a fallback entry with a missing provider', () => {
+    expect(() => ToolModelSwitch.validateConfig({ fallback: [{ model: 'gpt-x' }] })).toThrow(
+      'tool-model-switch: fallback entry 1 has a missing or non-string `provider`',
+    )
+  })
+
+  it('rejects a fallback entry with a non-string model', () => {
+    expect(() => ToolModelSwitch.validateConfig({ fallback: [{ provider: 'openai', model: 7 }] })).toThrow(
+      'tool-model-switch: fallback entry 1 has a missing or non-string `model`',
+    )
+  })
+
+  it('rejects a fallback entry with a non-string reasoning_effort', () => {
+    expect(() =>
+      ToolModelSwitch.validateConfig({ fallback: [{ provider: 'openai', model: 'gpt-x', reasoning_effort: 1 }] }),
+    ).toThrow('tool-model-switch: fallback entry 1 has a non-string `reasoning_effort`')
   })
 })
 

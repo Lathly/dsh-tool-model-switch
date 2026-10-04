@@ -7,6 +7,13 @@
  * so the agent can pick a route. Deployments that mount no session controller
  * (headless, SDK) fail the calls loudly at call time. Named exports preserve
  * loader injection metadata.
+ *
+ * `switch_model` runs a switch-time fallback ladder: the requested route is
+ * tried first, then each entry of the plugin's `fallback` config (priority 1,
+ * 2, ...). The first route live in the controller's catalog wins; when none of
+ * the candidates are live the call fails with the catalog's provider-failure
+ * messages. An in-turn retry (the response itself dying mid-stream) is not
+ * reachable from the plugin layer and is tracked separately.
  * @module @deepseek-ai/dsh-tool-model-switch
  */
 
@@ -18,6 +25,73 @@ import type { ModelCatalog, SessionSelectModelRequest } from '@deepseek-ai/dsh-a
 
 export const name = 'tool-model-switch'
 export const inject = ['tools']
+
+/** One alternative route the fallback ladder can fall back to. */
+export interface FallbackRoute {
+  /** Registered provider route id, for example `llamacpp` or `xai`. */
+  provider: string
+  /** Provider-owned model id, for example `Qwen3.8-27B-Ridge` or `grok-4.6`. */
+  model: string
+  /** Adapter-owned reasoning effort; omit to follow the provider default. */
+  reasoning_effort?: string
+}
+
+/**
+ * Plugin config, supplied by the row the deployment mounts the plugin on.
+ * `fallback` is the priority ladder `switch_model` walks when the requested
+ * route is not live. Omit (or leave empty) for no fallback — the requested
+ * route is then the only candidate and the call fails if it is not live.
+ */
+export interface Config {
+  fallback?: readonly FallbackRoute[]
+}
+
+/**
+ * Validate the row config. Throws with a fixed, deployment-actionable message
+ * on a malformed `fallback` list so a misconfiguration fails loud at load.
+ */
+export function validateConfig(value: unknown): Config {
+  if (value === undefined || value === null) return {}
+  if (typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('tool-model-switch: config must be an object with an optional `fallback` list')
+  }
+  const config = value as Record<string, unknown>
+  if (config.fallback === undefined) return {}
+  if (typeof config.fallback !== 'object' || config.fallback === null || !Array.isArray(config.fallback)) {
+    throw new Error('tool-model-switch: `fallback` must be a list of `{ provider, model }` routes')
+  }
+  for (const [index, entry] of config.fallback.entries()) {
+    const label = `fallback entry ${index + 1}`
+    if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) {
+      throw new Error(`tool-model-switch: ${label} must be an object with \`provider\` and \`model\``)
+    }
+    const route = entry as Record<string, unknown>
+    if (typeof route.provider !== 'string' || route.provider === '') {
+      throw new Error(`tool-model-switch: ${label} has a missing or non-string \`provider\``)
+    }
+    if (typeof route.model !== 'string' || route.model === '') {
+      throw new Error(`tool-model-switch: ${label} has a missing or non-string \`model\``)
+    }
+    if (route.reasoning_effort !== undefined && typeof route.reasoning_effort !== 'string') {
+      throw new Error(`tool-model-switch: ${label} has a non-string \`reasoning_effort\``)
+    }
+  }
+  return value as Config
+}
+
+/**
+ * Standard-schema validator the composition reads as `Plugin.Config` and applies
+ * to the row's config before the plugin starts (`runtime.Config['~standard'].validate`),
+ * so the priority list is validated at load rather than trusted raw. Mirrors
+ * {@link validateConfig}; `apply` re-validates regardless, so this is belt and
+ * braces.
+ */
+export const Config: { readonly '~standard': { readonly version: 1; readonly validate: (value: unknown) => Config } } = {
+  '~standard': {
+    version: 1,
+    validate: (value) => validateConfig(value),
+  },
+}
 
 const SWITCH_MODEL_DESCRIPTION =
   'Switch the LLM model that this session runs on. The switch takes effect from the agent\'s next model request '
@@ -34,8 +108,11 @@ const LIST_MODELS_DESCRIPTION =
  * delegate to the `sessionController` service lazily, so the package mounts
  * in every preset; only a call in a controller-less deployment fails.
  * @param ctx - registrant context carrying the tool registry.
+ * @param config - the row config, validated; its `fallback` list drives the ladder.
  */
-export function apply(ctx: Context): void {
+export function apply(ctx: Context, config?: Config): void {
+  const fallback = validateConfig(config).fallback
+
   ctx.tools.register(defineTool({
     name: 'switch_model',
     description: SWITCH_MODEL_DESCRIPTION,
@@ -53,18 +130,51 @@ export function apply(ctx: Context): void {
       if (agent === undefined) throw new Error('switch_model: no agent context for this call')
       const controller = ctx.get('sessionController')
       if (controller === undefined) throw new Error('switch_model: the session controller is not available in this deployment')
-      const effort = args.reasoning_effort !== undefined && args.reasoning_effort !== '' ? args.reasoning_effort : undefined
+
+      const requestedEffort = args.reasoning_effort !== undefined && args.reasoning_effort !== '' ? args.reasoning_effort : undefined
+
+      // Candidate ladder: the requested route first, then the `fallback` list
+      // in priority order, deduped so a repeated route is not tried twice.
+      const candidates: { provider: string; model: string; reasoningEffort?: string }[] = [
+        { provider: args.provider, model: args.model, ...(requestedEffort !== undefined ? { reasoningEffort: requestedEffort } : {}) },
+      ]
+      if (fallback !== undefined) {
+        for (const route of fallback) {
+          const isDuplicate = candidates.some((c) => c.provider === route.provider && c.model === route.model)
+          if (isDuplicate) continue
+          candidates.push({
+            provider: route.provider,
+            model: route.model,
+            ...(route.reasoning_effort !== undefined ? { reasoningEffort: route.reasoning_effort } : {}),
+          })
+        }
+      }
+
+      const catalog: ModelCatalog = await controller.modelCatalog()
+      const available = candidates.find((c) => isLiveInCatalog(catalog, c.provider, c.model))
+      if (available === undefined) {
+        const failures = catalog.failures.map((f) => `${f.id} — ${f.message}`).join('; ')
+        const detail = failures !== '' ? ` Known provider failures: ${failures}.` : ''
+        throw new Error(`switch_model: none of the ${candidates.length} candidate route(s) are currently available.${detail}`)
+      }
+
       const request: SessionSelectModelRequest = {
         sessionId: agent.id,
-        provider: args.provider,
-        model: args.model,
-        ...(effort !== undefined ? { reasoningEffort: effort } : {}),
+        provider: available.provider,
+        model: available.model,
+        ...(available.reasoningEffort !== undefined ? { reasoningEffort: available.reasoningEffort } : {}),
       }
       const result = await controller.selectModel(request)
       const selected = result.selected
       let text = `Switched this session's model to ${selected.provider}/${selected.model}`
       if (selected.reasoningEffort !== undefined) text += ` (reasoning effort ${selected.reasoningEffort})`
       text += '. Effective from the next model request; the default for new sessions now matches this selection.'
+
+      const usedFallback = selected.provider !== args.provider || selected.model !== args.model
+      if (usedFallback) {
+        const position = candidates.findIndex((c) => c.provider === selected.provider && c.model === selected.model)
+        text += ` The requested route was unavailable; priority ${position + 1} of ${candidates.length} was used instead.`
+      }
       return text
     },
     presentCall: args => ({ card: 'generic', title: 'Switch session model', kind: 'other', rawInput: args }),
@@ -95,4 +205,12 @@ export function apply(ctx: Context): void {
     },
     presentCall: () => ({ card: 'generic', title: 'List available models', kind: 'other', rawInput: {} }),
   }))
+}
+
+/**
+ * A candidate route is live when its provider group is in the catalog (the
+ * provider loaded) and the model id appears in that group's model list.
+ */
+function isLiveInCatalog(catalog: ModelCatalog, provider: string, model: string): boolean {
+  return catalog.groups.some((group) => group.id === provider && group.models.some((m) => m.id === model))
 }

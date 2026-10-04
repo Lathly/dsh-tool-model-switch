@@ -1,7 +1,7 @@
 {
   "name": "@lathly/dsh-tool-model-switch",
   "description": "DSH model switching tool \u2014 switch_model and list_models tools for runtime LLM route selection",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "license": "MIT",
   "repository": {
     "type": "git",
